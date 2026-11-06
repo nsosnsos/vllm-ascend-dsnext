@@ -1,0 +1,724 @@
+import math
+from contextlib import contextmanager
+from contextvars import ContextVar
+from enum import Enum
+from typing import Any
+
+import torch
+import vllm.envs as envs_vllm
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
+from vllm.logger import logger
+
+from vllm_ascend.ascend_config import (
+    compute_mega_moe_buffer_tokens_per_rank,
+    get_ascend_config,
+    is_mega_moe_supported,
+)
+from vllm_ascend.distributed.dp_moe_policy import DPMoEPolicy
+from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
+    has_layer_idx,
+    is_moe_model,
+)
+
+
+class MoECommType(Enum):
+    ALLGATHER = 0
+    MC2 = 1
+    ALLTOALL = 2
+    FUSED_MC2 = 3
+
+
+_MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
+
+
+_MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
+_DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
+_MC2_TOKENS_PER_RANK_LIMIT = 512
+
+
+def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return False
+
+    is_decode_bench = getattr(kv_transfer_config, "kv_connector", None) == "DecodeBenchConnector"
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    is_kv_consumer = (
+        kv_role == "kv_consumer"
+        if kv_role is not None
+        else bool(
+            getattr(kv_transfer_config, "is_kv_consumer", False)
+            and not getattr(kv_transfer_config, "is_kv_producer", False)
+        )
+    )
+    if not (is_decode_bench or is_kv_consumer):
+        return False
+
+    scheduler_config = getattr(get_ascend_config(), "scheduler_config", None)
+    # Actual semantics of `recompute_scheduler_enable`:
+    # - Enabled: when preemption occurs on the decode node, the request is sent back
+    #     to the P node to redo prefill, so the decode node only ever decodes;
+    # - Disabled: prefill is executed locally on the decode node.
+    return bool(getattr(scheduler_config, "recompute_scheduler_enable", False))
+
+
+@contextmanager
+def override_mrv2_in_profile_run(enabled: bool):
+    """Override MRv2's extra profile-run marker for one forward path.
+
+    MRv2 builds the base forward context inside upstream vLLM, so Ascend's
+    platform hook cannot tell whether the current forward is the extra MC2
+    profile dummy run. A ContextVar keeps this MRv2-only state scoped to the
+    current forward path without adding default fallback behavior.
+    """
+    token = _MRV2_IN_PROFILE_RUN.set(enabled)
+    try:
+        yield
+    finally:
+        _MRV2_IN_PROFILE_RUN.reset(token)
+
+
+def get_mrv2_in_profile_run() -> bool:
+    return _MRV2_IN_PROFILE_RUN.get()
+
+
+def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
+    # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
+    return (
+        is_mega_moe_supported()
+        and get_ascend_device_type() == AscendDeviceType.A3
+        and get_ascend_config().enable_fused_mc2 == 1
+        and is_moe_model(vllm_config)
+        and vllm_config.parallel_config.enable_expert_parallel
+        and 1 < get_ep_group().world_size <= 64
+        and getattr(vllm_config, "lora_config", None) is None
+    )
+
+
+_DRAFT_MOE_TOPOLOGY_LOGGED: set[tuple[int, int, int]] = set()
+
+
+def _resolve_draft_moe_topology(
+    vllm_config: VllmConfig,
+    is_draft_model: bool,
+) -> tuple[tuple[int, int, int] | None, bool]:
+    """Resolve the draft model's MoE topology key when it differs from the
+    target's.
+
+    The A5 MegaMoE symmetric buffer is process-wide and single-topology: it
+    is created by the target model and cannot be re-created for another
+    expert layout during inference. A draft whose MoE topology differs from
+    the target's (e.g. the DeepSeek V4.1 Aurora DSpark draft: 128 experts /
+    top-3 vs the target's 384 / top-6) therefore must (1) bypass the fused
+    A5 MegaMoE path and (2) resolve its own comm-method instances from the
+    topology-keyed registry. Drafts sharing the target's topology (e.g. the
+    DeepSeek V4 DSpark draft) keep the flat-registry fused path untouched.
+    """
+    if not is_draft_model:
+        return None, False
+    draft_model_config = getattr(getattr(vllm_config, "speculative_config", None), "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_text_config", None)
+    if draft_hf_config is None:
+        return None, False
+    draft_num_experts = getattr(draft_hf_config, "n_routed_experts", None)
+    draft_experts_per_token = getattr(draft_hf_config, "num_experts_per_tok", None)
+    target_hf_config = vllm_config.model_config.hf_text_config
+    target_num_experts = getattr(target_hf_config, "n_routed_experts", None)
+    target_experts_per_token = getattr(target_hf_config, "num_experts_per_tok", None)
+    if (
+        draft_num_experts is None
+        or draft_experts_per_token is None
+        or target_num_experts is None
+        or (draft_num_experts == target_num_experts and draft_experts_per_token == target_experts_per_token)
+    ):
+        return None, False
+
+    # Imported lazily: moe_comm_method imports MoECommType from this module.
+    from vllm_ascend.ops.fused_moe.moe_comm_method import make_moe_topology_key
+
+    topology_key = make_moe_topology_key(draft_num_experts, draft_experts_per_token, get_ep_group().world_size)
+    if topology_key not in _DRAFT_MOE_TOPOLOGY_LOGGED:
+        _DRAFT_MOE_TOPOLOGY_LOGGED.add(topology_key)
+        logger.info(
+            "Draft model MoE topology differs from the target's (num_experts=%d vs %d, "
+            "experts_per_token=%d vs %d); using topology-scoped MoE comm methods and "
+            "bypassing the fused A5 MegaMoE path for the draft forward.",
+            draft_num_experts,
+            target_num_experts,
+            draft_experts_per_token,
+            target_experts_per_token,
+        )
+    return topology_key, True
+
+
+@contextmanager
+def set_ascend_forward_context(
+    attn_metadata: Any,
+    vllm_config: VllmConfig,
+    num_tokens: int = 0,
+    num_tokens_across_dp: torch.Tensor | None = None,
+    in_profile_run: bool = False,
+    num_actual_tokens: int | None = None,
+    aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    batch_descriptor: BatchDescriptor | None = None,
+    model_instance: torch.nn.Module = None,
+    is_draft_model=False,
+    skip_compiled: bool = False,
+    max_tokens_across_pcp: int = 0,
+    draft_attn_metadatas=None,
+    device_metadata_executor=None,
+    has_sinks=False,
+    eplb_heat_collection_status: bool = False,
+    dp_moe_policy: DPMoEPolicy | None = None,
+):
+    """A context manager that stores the current forward context,
+    can be attention metadata, etc.
+    We add some additional param into forward_context.
+
+    Also publish the process-global current vLLM config for this forward so
+    CustomOps (RMSNorm, rotary, Linear, MoE) can call get_current_vllm_config()
+    from ``__init__`` when they are first created during eager prefill.
+    ``set_current_vllm_config`` is a context manager and restores ``None`` on
+    exit, so wrapping only ``load_model`` is not enough; pin it here instead of
+    in the Worker.
+    """
+    forward_context_kwargs = {
+        "attn_metadata": attn_metadata,
+        "vllm_config": vllm_config,
+        "num_tokens": num_tokens,
+        "num_tokens_across_dp": num_tokens_across_dp,
+        "cudagraph_runtime_mode": aclgraph_runtime_mode,
+        "batch_descriptor": batch_descriptor,
+        "skip_compiled": skip_compiled,
+    }
+    with set_current_vllm_config(vllm_config), set_forward_context(**forward_context_kwargs):
+        forward_context = get_forward_context()
+        forward_context.draft_attn_metadatas = draft_attn_metadatas
+        forward_context.device_metadata_executor = device_metadata_executor
+
+        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+
+        if dp_moe_policy is not None:
+            dp_moe_policy.check_num_tokens(num_tokens)
+            moe_comm_type = dp_moe_policy.comm_type
+            moe_topology_key = dp_moe_policy.topology
+        else:
+            max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+            moe_topology_key, is_secondary_moe_topology = _resolve_draft_moe_topology(vllm_config, is_draft_model)
+            moe_comm_type = select_moe_comm_method(
+                max_num_tokens,
+                vllm_config,
+                model_instance=model_instance,
+                is_secondary_moe_topology=is_secondary_moe_topology,
+            )
+
+        forward_context.dp_moe_policy = dp_moe_policy
+        forward_context.moe_comm_type = moe_comm_type
+        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type, moe_topology_key)
+        forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
+        forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        forward_context.in_profile_run = in_profile_run
+
+        # NOTE: This cannot be set using set_forward_context
+        # due to multiple warmups before actual capturing
+        forward_context.capturing = False
+
+        # TODO: remove it when fia merge in fiav2
+        forward_context.sinks = has_sinks
+
+        # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
+        mmrs_fusion = tp_world_size <= 8
+
+        forward_context.mmrs_fusion = mmrs_fusion
+        forward_context.num_tokens = num_tokens
+        # set this for rope forward_oot using
+        forward_context.is_first_layer = True
+
+        # set layer_idx to enable optimization features that depend on this information.
+        # This is only applicable to models that contain these necessary attributes.
+        forward_context.layer_idx = None
+        if has_layer_idx(model_instance):
+            forward_context.layer_idx = model_instance.model.start_layer
+
+        forward_context.prefetch_mlp_gate_up_proj = False
+        forward_context.prefetch_mlp_down_proj = False
+        forward_context.model_instance = model_instance
+        forward_context.is_draft_model = is_draft_model
+        forward_context.is_draft_model_prefill = False
+
+        if num_tokens is None and attn_metadata is not None:
+            num_tokens = attn_metadata.num_actual_tokens
+
+        dp_world_size = get_dp_group().world_size
+        if dp_world_size > 1 and forward_context.dp_metadata is not None:
+            dp_meta = forward_context.dp_metadata
+            max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
+        else:
+            max_tokens_across_dp = num_tokens
+
+        forward_context.max_tokens_across_dp = max_tokens_across_dp
+        forward_context.max_tokens_across_pcp = max_tokens_across_pcp
+        forward_context.padded_length = (
+            math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            if max_tokens_across_dp is not None
+            else None
+        )
+
+        forward_context.eplb_heat_collection_status = eplb_heat_collection_status
+
+        if num_tokens is not None:
+            if num_actual_tokens is None:
+                num_actual_tokens = num_tokens
+            # NOTE: token num which need to pad to when mc2
+            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            reserved_mc2_mask = get_mc2_mask()
+            if reserved_mc2_mask is not None:
+                mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
+                mc2_mask[:num_actual_tokens] = True
+                mc2_mask[num_actual_tokens:] = False
+                forward_context.mc2_mask = mc2_mask
+        try:
+            yield
+        finally:
+            pass
+
+
+_mc2_tokens_capacity: int | None = None
+_reserved_mc2_mask: torch.Tensor | None = None
+
+
+def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len):
+    global _mc2_tokens_capacity
+    if _mc2_tokens_capacity is not None:
+        return
+
+    ascend_config = get_ascend_config()
+    use_mega_moe = use_cann_megamoe(vllm_config)
+
+    # Cap for fused MC2 / MegaMoe: regular MC2 (gated by enable_prefill_mc2) uses
+    # HCCL comm buffer (HCCL_BUFFSIZE); MegaMoe (use_mega_moe, non-decode-only)
+    # uses the symm buffer (separate torch alloc, not HCCL_BUFFSIZE).
+    if ascend_config.enable_prefill_mc2 or (use_mega_moe and not _is_decode_only_node(vllm_config)):
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    elif vllm_config.compilation_config.cudagraph_capture_sizes:
+        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
+    else:
+        max_num_tokens = max_num_reqs * uniform_decode_query_len
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    # Use integer arithmetic for ceiling division.
+    num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
+    # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
+    if ascend_config.enable_fused_mc2:
+        if use_mega_moe:
+            num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
+        else:
+            num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
+
+    # keep the num_tokens_per_tp_rank less than mc2 tokens per rank limit
+    else:
+        num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MC2_TOKENS_PER_RANK_LIMIT)
+    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+
+
+def get_mc2_tokens_capacity():
+    return _mc2_tokens_capacity
+
+
+def get_a5_mega_moe_buffer_tokens_per_rank(
+    vllm_config: VllmConfig,
+    mc2_tokens_capacity: int | None = None,
+) -> int:
+    """Resolve the A5 MegaMoE capacity for the current PD role."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    is_kv_producer = bool(getattr(kv_transfer_config, "is_kv_producer", False))
+    if kv_transfer_config is None or kv_role in ("kv_producer", "kv_both") or (kv_role is None and is_kv_producer):
+        execution_tokens_per_rank = vllm_config.scheduler_config.max_num_batched_tokens
+    else:
+        if mc2_tokens_capacity is None:
+            mc2_tokens_capacity = get_mc2_tokens_capacity()
+        if mc2_tokens_capacity is None:
+            raise RuntimeError("MC2 token capacity must be initialized before using A5 MegaMoE.")
+        execution_tokens_per_rank = mc2_tokens_capacity
+
+    ascend_config = get_ascend_config()
+    expert_parallel_size = vllm_config.parallel_config.world_size_across_dp
+    buffer_tokens_per_rank = compute_mega_moe_buffer_tokens_per_rank(
+        ascend_config.mega_moe_max_tokens,
+        execution_tokens_per_rank,
+        expert_parallel_size,
+    )
+    return buffer_tokens_per_rank
+
+
+def set_mc2_mask(vllm_config, device):
+    global _reserved_mc2_mask
+    if _reserved_mc2_mask is not None:
+        return
+    if is_moe_model(vllm_config):
+        _reserved_mc2_mask = torch.zeros(
+            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device
+        )
+    else:
+        _reserved_mc2_mask = None
+
+
+def get_mc2_mask():
+    return _reserved_mc2_mask
+
+
+def _select_a2_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    mc2_tokens_capacity: int,
+) -> MoECommType:
+    num_experts = vllm_config.model_config.get_num_experts()
+    ep_world_size = (
+        vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+    )
+    num_experts_per_device = num_experts // ep_world_size
+    if (
+        num_experts_per_device <= 24
+        and ep_world_size >= 16
+        and (num_tokens is None or num_tokens <= mc2_tokens_capacity)
+    ):
+        return MoECommType.MC2
+    return MoECommType.ALLGATHER
+
+
+def _select_a3_moe_comm_method(
+    num_tokens: int,
+    mc2_tokens_capacity: int,
+    vllm_config: VllmConfig,
+) -> MoECommType:
+    if use_cann_megamoe(vllm_config):
+        return MoECommType.FUSED_MC2
+    if get_ascend_config().enable_fused_mc2 == 1 and get_ep_group().world_size <= 32:
+        return MoECommType.FUSED_MC2
+
+    if num_tokens is None or num_tokens <= mc2_tokens_capacity:
+        return MoECommType.MC2
+
+    return MoECommType.ALLTOALL
+
+
+def _select_a5_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    mc2_tokens_capacity: int,
+    quant_type: QuantType | None,
+    activation: str | None,
+    group_size: int | None,
+    is_secondary_moe_topology: bool = False,
+) -> MoECommType:
+    num_experts_per_tok = getattr(
+        vllm_config.model_config.hf_text_config,
+        "num_experts_per_tok",
+        getattr(vllm_config.model_config.hf_text_config, "top_k_experts", 1),
+    )
+    world_size = vllm_config.parallel_config.world_size_across_dp
+    ascend_config = get_ascend_config()
+    eplb_config = ascend_config.eplb_config
+    kv_role = getattr(getattr(vllm_config, "kv_transfer_config", None), "kv_role", None)
+    buffer_tokens_per_rank = (
+        get_a5_mega_moe_buffer_tokens_per_rank(vllm_config, mc2_tokens_capacity)
+        if ascend_config.enable_fused_mc2 == 1
+        else 0
+    )
+    normalized_activation = None if activation is None else activation.lower().removeprefix("moeactivation.")
+    use_mega_moe = (
+        ascend_config.enable_fused_mc2 == 1
+        and world_size > 1
+        # The A5 MegaMoE symmetric buffer is process-wide and single-topology:
+        # it is created by the target model and cannot be re-created for a
+        # different expert layout during inference. A draft whose MoE topology
+        # differs from the target's must never take this path.
+        and not is_secondary_moe_topology
+        and num_tokens <= buffer_tokens_per_rank
+        and quant_type in _A5_MEGA_MOE_QUANT_TYPES
+        and normalized_activation in (None, "silu", "swiglu")
+        and group_size in (None, _A5_MEGA_MOE_GROUP_SIZE)
+        and not eplb_config.dynamic_eplb
+        and eplb_config.num_redundant_experts == 0
+        and not ascend_config.mix_placement
+        and kv_role != "kv_consumer"
+    )
+    if use_mega_moe:
+        return MoECommType.FUSED_MC2
+    if (num_tokens is None or num_tokens <= mc2_tokens_capacity) and world_size > 1:
+        return MoECommType.MC2
+    if world_size <= num_experts_per_tok:
+        return MoECommType.ALLGATHER
+    return MoECommType.ALLTOALL
+
+
+_A5_MEGA_MOE_QUANT_TYPES = {
+    QuantType.W4A8MXFP,
+}
+_A5_MEGA_MOE_GROUP_SIZE = 32
+_A5_CONFIG_CACHE_LIMIT = 16
+_A5_MOE_QUANT_TYPES_BY_CONFIG_ID: dict[int, tuple[object, Any]] = {}
+_A5_MOE_ACTIVATIONS_BY_CONFIG_ID: dict[int, tuple[object, Any]] = {}
+
+
+def _get_a5_config_cache_value(cache: dict[int, tuple[object, Any]], vllm_config: VllmConfig) -> tuple[bool, Any]:
+    config_id = id(vllm_config)
+    entry = cache.get(config_id)
+    if entry is None:
+        return False, None
+    owner, value = entry
+    if owner is not vllm_config:
+        # Object IDs can be reused after an engine/config is destroyed.
+        del cache[config_id]
+        return False, None
+    return True, value
+
+
+def _set_a5_config_cache_value(cache: dict[int, tuple[object, Any]], vllm_config: VllmConfig, value: Any) -> None:
+    config_id = id(vllm_config)
+    if config_id not in cache and len(cache) >= _A5_CONFIG_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    cache[config_id] = (vllm_config, value)
+
+
+def cache_a5_moe_quant_type(
+    vllm_config: VllmConfig | None,
+    quant_type: QuantType,
+) -> None:
+    if vllm_config is None:
+        return
+    _set_a5_config_cache_value(_A5_MOE_QUANT_TYPES_BY_CONFIG_ID, vllm_config, quant_type)
+
+
+def _get_a5_moe_quant_type(
+    vllm_config: VllmConfig,
+    model_instance: torch.nn.Module | None,
+) -> QuantType | None:
+    """Routed-experts quant type amortized per vllm_config.
+
+    The module scan walks the full model tree, so it must stay a one-time
+    cache-miss fallback; the per-step path is a dict lookup.
+    """
+    found, cached = _get_a5_config_cache_value(_A5_MOE_QUANT_TYPES_BY_CONFIG_ID, vllm_config)
+    if found:
+        return cached
+    quant_type: QuantType | None = None
+    if model_instance is not None:
+        modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
+        for module in modules:
+            if not hasattr(module, "moe_config"):
+                continue
+            module_quant_type = getattr(module, "quant_type", None)
+            if (
+                isinstance(module_quant_type, QuantType)
+                and module_quant_type != QuantType.NONE
+            ):
+                quant_type = module_quant_type
+                break
+    if quant_type is not None or model_instance is not None:
+        _set_a5_config_cache_value(_A5_MOE_QUANT_TYPES_BY_CONFIG_ID, vllm_config, quant_type)
+    return quant_type
+
+
+def _get_a5_moe_activation(
+    vllm_config: VllmConfig,
+    model_instance: torch.nn.Module | None,
+) -> str | None:
+    """MoE activation amortized per vllm_config.
+
+    No current MoE module exposes ``activation``, so the scan is a one-time
+    fallback; the per-step path is a dict lookup.
+    """
+    found, cached = _get_a5_config_cache_value(_A5_MOE_ACTIVATIONS_BY_CONFIG_ID, vllm_config)
+    if found:
+        return cached
+    activation: str | None = None
+    if model_instance is not None:
+        modules = model_instance.modules() if callable(getattr(model_instance, "modules", None)) else ()
+        for module in modules:
+            if not hasattr(module, "moe_config"):
+                continue
+            module_activation = getattr(module, "activation", None)
+            if isinstance(module_activation, str):
+                activation = module_activation
+                break
+            if isinstance(module_activation, Enum):
+                activation = module_activation.name
+                break
+    if activation is None:
+        hf_text_config = vllm_config.model_config.hf_text_config
+        activation = getattr(
+            hf_text_config,
+            "hidden_act",
+            getattr(hf_text_config, "hidden_activation", None),
+        )
+    if activation is not None or model_instance is not None:
+        _set_a5_config_cache_value(_A5_MOE_ACTIVATIONS_BY_CONFIG_ID, vllm_config, activation)
+    return activation
+
+
+def _get_a5_moe_group_size(vllm_config: VllmConfig) -> int | None:
+    quant_description = getattr(getattr(vllm_config, "quant_config", None), "quant_description", None)
+    if isinstance(quant_description, dict):
+        return quant_description.get("group_size")
+    return getattr(quant_description, "group_size", None)
+
+
+def select_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    model_instance: torch.nn.Module | None = None,
+    is_secondary_moe_topology: bool = False,
+) -> MoECommType | None:
+    """Select the MoE communication method according to parallel settings,
+    device generation, and token count.
+
+    1. Non-MoE models return `None`.
+    2. Without expert parallel, fall back to all-gather.
+    3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
+       and the DP size is large enough; otherwise use all-gather.
+    4. On A3 with expert parallel, prefer fused MC2 when enabled and the EP
+       group size is small enough; otherwise use MC2 within capacity or
+       all-to-all.
+    5. On 310P, always use all-gather.
+    6. On A5 with expert parallel, use MegaMoE for supported MXFP layouts
+        within its symmetric-buffer capacity; otherwise use MC2, all-gather,
+        or all-to-all according to the existing token and EP constraints.
+    7. A draft whose MoE topology differs from the target's never selects
+        the fused A5 MegaMoE path: its symmetric buffer is process-wide and
+        single-topology, so it is sized for the target's experts only. It
+        follows the same MC2/all-gather/all-to-all token and EP constraints
+        as the primary topology, and on A5 its MC2 dispatch/combine runs on
+        the dedicated draft communication domain.
+
+    Args:
+        num_tokens (int): The number of tokens in the current batch.
+        vllm_config (VllmConfig): Runtime configuration for the model.
+        model_instance (torch.nn.Module | None): Model instance used to
+            resolve the A5 routed-expert quantization and activation.
+        is_secondary_moe_topology (bool): Whether this forward belongs to a
+            draft whose MoE topology differs from the target's.
+
+    Raises:
+        ValueError: If the soc version is unsupported.
+
+    Returns:
+        MoECommType | None: The selected MoE communication method.
+    """
+    if not is_moe_model(vllm_config):
+        return None
+
+    mc2_tokens_capacity = get_mc2_tokens_capacity()
+    soc_version = get_ascend_device_type()
+    lora_config = getattr(vllm_config, "lora_config", None)
+    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+        moe_comm_type = MoECommType.ALLGATHER
+    elif lora_config is not None and vllm_config.parallel_config.enable_expert_parallel:
+        # LoRA + EP requires AlltoAll because the MC2/FusedMC2 paths
+        # Ascend MoE LoRA cannot patch FusedMC2 path for dispatch_ffn_combine/mega_moe
+        # is a single fused C++ op. This covers both normal model
+        # forward and _dummy_run during profile_run.
+        moe_comm_type = MoECommType.ALLTOALL
+    elif soc_version == AscendDeviceType.A2:
+        moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
+    elif soc_version == AscendDeviceType.A3:
+        moe_comm_type = _select_a3_moe_comm_method(
+            num_tokens,
+            mc2_tokens_capacity,
+            vllm_config,
+        )
+    elif soc_version == AscendDeviceType.A5:
+        moe_comm_type = _select_a5_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            mc2_tokens_capacity,
+            _get_a5_moe_quant_type(vllm_config, model_instance),
+            _get_a5_moe_activation(vllm_config, model_instance),
+            _get_a5_moe_group_size(vllm_config),
+            is_secondary_moe_topology=is_secondary_moe_topology,
+        )
+    elif soc_version == AscendDeviceType._310P:
+        moe_comm_type = MoECommType.ALLGATHER
+
+    else:
+        raise ValueError(f"Unsupported soc_version: {soc_version}")
+    logger.debug(
+        "MoE comm method selected: soc=%s, method=%s, num_tokens=%d, mc2_capacity=%s",
+        soc_version,
+        moe_comm_type,
+        num_tokens,
+        mc2_tokens_capacity,
+    )
+    return moe_comm_type
+
+
+class _ExtraForwardContextProxy:
+    """Unified forward-context access for v1/v2 model runners."""
+
+    extra_attrs = (
+        "capturing",
+        "moe_comm_type",
+        "moe_comm_method",
+        "is_decode_only_node",
+        "use_mega_moe",
+        "mmrs_fusion",
+        "num_tokens",
+        "padded_length",
+        "num_tokens_across_dp",
+        "mc2_mask",
+        "is_draft_model",
+        "is_draft_model_prefill",
+        "prefetch_mlp_gate_up_proj",
+        "prefetch_mlp_down_proj",
+        "model_instance",
+        "layer_idx",
+        "max_tokens_across_dp",
+        "dp_moe_policy",
+        "max_tokens_across_pcp",
+        "num_accept_tokens",
+        "in_profile_run",
+        "padded_num_tokens",
+        "sinks",
+        "eplb_heat_collection_status",
+    )
+
+    def check_extra_attr(self, name: str):
+        if name not in self.extra_attrs:
+            raise AttributeError(
+                f"{name} is not extra forward context attribute, "
+                "please get/set it from vllm's _forward_context directly."
+            )
+
+    @staticmethod
+    def _ctx():
+        return get_forward_context()
+
+    def __getattr__(self, name: str) -> Any:
+        self.check_extra_attr(name)
+        ctx = self._ctx()
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            # Unset known extras default to None so optional flags (e.g. `sinks`)
+            # can be read with truthiness checks before the V2 path populates them.
+            return ctx.additional_kwargs.get(name)
+        return getattr(ctx, name, None)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self.check_extra_attr(name)
+        ctx = self._ctx()
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            ctx.additional_kwargs[name] = value
+        else:
+            setattr(ctx, name, value)
+
+
+# usage: from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+_EXTRA_CTX = _ExtraForwardContextProxy()

@@ -1,0 +1,43 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2026, vllm-ascend team
+# This file is distributed under the same license as the vllm-ascend package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: vllm-ascend\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-08 14:01+0000\n"
+"PO-Revision-Date: 2026-07-08 14:01+0000\n"
+"Last-Translator: \n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"Generated-By: detect_po_changes.py\n"
+
+msgid "# Sequence Parallelism"
+msgstr "# 序列并行"
+
+msgid "## Overview"
+msgstr "## 概述"
+
+msgid ""
+"Sequence Parallelism (SP) shards the token dimension across tensor-parallel\n"
+"ranks around the communication boundaries of transformer layers. vLLM owns"
+msgstr "序列并行（SP）将token维度在张量并行rank之间进行切分，并围绕Transformer层的通信边界进行。vLLM拥有"
+
+msgid "## How to use"
+msgstr "## 使用方法"
+
+msgid ""
+"Automatically enabled when DP>1, TP>1 are set, and specific all2all backend with moe model.\n"
+"The former FlashComm settings are removed."
+msgstr ""
+"当设置DP>1、TP>1，且使用特定的all2all后端与MoE模型时，自动启用。\n"
+"原有的FlashComm设置已移除。"
+
+msgid "Use the upstream SP configuration shown above instead."
+msgstr "请改用上方所示的上游SP配置。"

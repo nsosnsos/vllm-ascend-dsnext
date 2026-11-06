@@ -1,0 +1,884 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM Ascend 请求全链路：curl → Router → EngineCore → Model → Client</title>
+<style>
+  :root {
+    --bg:#fbfbfd; --panel:#fff; --ink:#1c2330; --muted:#5b6577; --line:#dde3ec;
+    --accent:#2f6feb; --accent-soft:#eaf1ff; --code:#f4f6fa;
+    --router:#b45f06; --router-soft:#fff3e2; --engine:#0b7285; --engine-soft:#e6f7fa;
+    --worker:#5f3dc4; --worker-soft:#f1ecff; --parse:#2b8a3e; --parse-soft:#eaf7ee;
+    --warn:#b02a37; --warn-soft:#fdecef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#10141b; --panel:#161c26; --ink:#e7ecf4; --muted:#a3adbf; --line:#2a3444;
+      --accent:#7aa7ff; --accent-soft:#1b2740; --code:#0f141c;
+      --router:#f0a95a; --router-soft:#352713; --engine:#5ec8dc; --engine-soft:#0f2b31;
+      --worker:#b39cf5; --worker-soft:#241d3d; --parse:#7ad18f; --parse-soft:#142a1b;
+      --warn:#ff8f9c; --warn-soft:#341b20;
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif}
+  .layout{display:grid;grid-template-columns:280px minmax(0,1fr)}
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+    padding:28px 20px 40px;border-right:1px solid var(--line);background:var(--panel)}
+  nav .brand{font-weight:700;font-size:15px}
+  nav .brand small{display:block;font-weight:400;color:var(--muted);margin-top:4px}
+  nav ol{list-style:none;padding:0;margin:22px 0 0;font-size:14px}
+  nav li{margin:0 0 2px}
+  nav a{display:block;padding:6px 10px;border-radius:8px;color:var(--muted);text-decoration:none}
+  nav a:hover{background:var(--accent-soft);color:var(--accent)}
+  main{padding:44px 56px 96px;max-width:1180px}
+  h1{font-size:30px;line-height:1.3;margin:0 0 10px}
+  h2{font-size:22px;margin:52px 0 14px;padding-top:10px;border-top:1px solid var(--line)}
+  h3{font-size:17px;margin:28px 0 10px}
+  h4{font-size:15px;margin:20px 0 8px}
+  .lede{color:var(--muted);font-size:16px;margin:0 0 8px}
+  .meta{color:var(--muted);font-size:13px}
+  code,pre{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
+  code{background:var(--code);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:13.5px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;
+    padding:16px 18px;overflow-x:auto;font-size:13px;line-height:1.55}
+  pre code{background:none;border:0;padding:0;font-size:inherit}
+  .note{border-left:4px solid var(--accent);background:var(--accent-soft);
+    padding:12px 16px;border-radius:0 8px 8px 0;margin:16px 0}
+  .note.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .card h4{margin-top:0}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  th{background:var(--accent-soft);font-weight:600}
+  .tag{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:999px;white-space:nowrap}
+  .t-router{color:var(--router);background:var(--router-soft)}
+  .t-engine{color:var(--engine);background:var(--engine-soft)}
+  .t-worker{color:var(--worker);background:var(--worker-soft)}
+  .t-parse{color:var(--parse);background:var(--parse-soft)}
+  .t-warn{color:var(--warn);background:var(--warn-soft)}
+  .chain{display:grid;gap:0;margin:18px 0 8px}
+  .hop{position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:12px;padding:14px 18px 14px 58px}
+  .hop+.hop{margin-top:26px}
+  .hop+.hop::before{content:"";position:absolute;left:29px;top:-27px;height:26px;border-left:2px dashed var(--line)}
+  .hop .num{position:absolute;left:14px;top:14px;width:30px;height:30px;border-radius:50%;
+    display:grid;place-items:center;font-weight:700;font-size:13px;color:#fff;background:var(--accent)}
+  .hop h4{margin:0 0 4px;font-size:15px}
+  .hop .where{color:var(--muted);font-size:13px;margin-bottom:8px}
+  .hop.router .num{background:var(--router)}
+  .hop.engine .num{background:var(--engine)}
+  .hop.worker .num{background:var(--worker)}
+  .hop.parse .num{background:var(--parse)}
+  .flow{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:18px 0 6px}
+  .flow .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:12px 10px;text-align:center;font-size:13px;position:relative}
+  .flow .box b{display:block;font-size:14px;margin-bottom:2px}
+  .flow .box::after{content:"→";position:absolute;right:-12px;top:50%;transform:translateY(-50%);color:var(--muted)}
+  .flow .box:last-child::after{content:""}
+  @media(max-width:1000px){
+    .layout{grid-template-columns:1fr}
+    nav{position:static;height:auto;border-right:0;border-bottom:1px solid var(--line)}
+    main{padding:28px 20px 64px}
+    .flow{grid-template-columns:1fr 1fr}
+    .flow .box::after{content:""}
+    .split{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+  <div class="brand">vLLM Ascend<small>请求全链路详解</small></div>
+  <ol>
+    <li><a href="#overview">0. 总览与进程边界</a></li>
+    <li><a href="#router">1. Router 接入</a></li>
+    <li><a href="#router-regular">2. 普通模式转发</a></li>
+    <li><a href="#router-pd">3. PD 两阶段转发</a></li>
+    <li><a href="#mooncake">4. Mooncake 池化与传输</a></li>
+    <li><a href="#api-server">5. vLLM API Server</a></li>
+    <li><a href="#parsers-request">6. 解析器初始化与请求改写</a></li>
+    <li><a href="#engine">7. EngineCore 调度</a></li>
+    <li><a href="#worker">8. Worker 与模型 forward</a></li>
+    <li><a href="#sampling">9. 采样与 token 回传</a></li>
+    <li><a href="#parsers-response">10. reasoning / tool call 解析</a></li>
+    <li><a href="#response">11. 响应回传</a></li>
+    <li><a href="#failure">12. 异常与边界</a></li>
+    <li><a href="#reference">13. 速查表</a></li>
+  </ol>
+</nav>
+<main>
+
+<h1>一次 <code>curl</code> 的完整旅程</h1>
+<p class="lede">从 Router 端口进入，经代理与负载均衡，到 vLLM API Server、EngineCore、NPU Worker，
+完成模型 forward 与采样，再经 reasoning / tool call 解析回到客户端。</p>
+<p class="meta">代码基线：vLLM <code>6e448d0e</code>，vLLM Ascend 当前分支，vLLM Router 当前 checkout。
+行号对应当前工作区文件。</p>
+
+<div class="note">第 2、3 节是二选一的分支；第 4 节说明 Mooncake 的两套独立用法。
+其余章节是两条分支共用的后续流程。</div>
+
+<h2 id="overview">0. 总览与进程边界</h2>
+<div class="flow">
+  <div class="box"><b>curl</b>HTTP 客户端</div>
+  <div class="box"><b>Router</b>鉴权 / 限流 / 选 worker</div>
+  <div class="box"><b>API Server</b>渲染 / 入队 / 回包</div>
+  <div class="box"><b>EngineCore</b>调度 / 采样循环</div>
+  <div class="box"><b>Worker</b>forward + logits</div>
+</div>
+
+<table>
+  <thead><tr><th>边界</th><th>通信方式</th><th>主要数据</th></tr></thead>
+  <tbody>
+    <tr><td>curl → Router</td><td>HTTP，流式为 chunked SSE</td><td>OpenAI Chat Completions JSON</td></tr>
+    <tr><td>Router → vLLM API Server</td><td>HTTP，reqwest 连接池</td><td>同一个 JSON，PD 模式下可能被改写</td></tr>
+    <tr><td>API Server → EngineCore</td><td>ZeroMQ + msgpack</td><td><code>EngineCoreRequest</code> / <code>EngineCoreOutputs</code></td></tr>
+    <tr><td>EngineCore → Worker</td><td><code>collective_rpc</code>（MQ RPC）</td><td><code>SchedulerOutput</code> / <code>GrammarOutput</code> / <code>ModelRunnerOutput</code></td></tr>
+    <tr><td>Worker → NPU</td><td>torch_npu / ACLGraph replay</td><td>张量与 attention 元数据</td></tr>
+  </tbody>
+</table>
+
+<div class="note">Router 不做 tokenize，也不碰模型。它只决定“哪个 vLLM 实例来干”，
+并把响应原样或按 PD 规则回传。</div>
+
+<h2 id="router">1. Router 接入</h2>
+<div class="chain">
+  <div class="hop router">
+    <div class="num">1</div>
+    <h4>监听与路由注册</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>src/main.rs::main</code> → <code>src/server.rs::startup</code></div>
+    <p><code>startup</code> 创建 <code>reqwest::Client</code>、<code>AppContext</code>、
+    <code>WorkerRegistry</code>、<code>PolicyRegistry</code>，由 <code>RouterFactory</code>
+    按 <code>RoutingMode</code> 创建具体 router。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">2</div>
+    <h4>中间件</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>src/middleware.rs</code></div>
+    <p><code>RequestIdLayer</code> 读取 <code>x-request-id</code> 等头，缺省生成
+    <code>chatcmpl-…</code>；<code>concurrency_limit_middleware</code> 从
+    <code>TokenBucket</code> 取令牌，满了就入队或拒绝。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">3</div>
+    <h4>路由处理函数</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>src/server.rs:245</code> <code>v1_chat_completions</code></div>
+    <p>可选的 <code>authorize_request</code> 校验 Bearer token，然后调用
+    <code>state.router.route_chat(headers, body, None)</code>。</p>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th>启动方式</th><th>实现</th><th>行为</th></tr></thead>
+  <tbody>
+    <tr><td>默认 <code>--worker-urls</code></td><td><code>Router</code></td><td>选一个 worker，单次 HTTP 转发</td></tr>
+    <tr><td><code>--vllm-pd-disaggregation</code></td><td><code>VllmPDRouter</code></td><td>先 prefill，再 decode</td></tr>
+    <tr><td><code>--backend openai</code></td><td><code>OpenAIRouter</code></td><td>固定上游，剥离 vLLM 专有字段</td></tr>
+    <tr><td><code>--enable-igw</code></td><td><code>RouterManager</code></td><td>按 model 与 worker 类型选子 router</td></tr>
+  </tbody>
+</table>
+
+<h2 id="router-regular">2. 普通模式转发</h2>
+<div class="chain">
+  <div class="hop router">
+    <div class="num">4</div>
+    <h4>进入 typed 路由</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>router/src/routers/http/router.rs:2223</code> → <code>:1031</code></div>
+    <p><code>route_chat</code> 调用 <code>route_typed_request</code>。后者用
+    <code>extract_text_for_routing()</code> 取哈希文本，再用 <code>RetryExecutor</code>
+    包住每次尝试。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">5</div>
+    <h4>选择 worker</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>router.rs:997</code> <code>select_worker_for_model</code></div>
+    <p><code>WorkerRegistry.get_by_model_fast(model)</code> → 过滤 <code>is_available()</code>
+    （健康 + 熔断）→ <code>policy.select_worker_with_headers(...)</code>。</p>
+    <table>
+      <thead><tr><th>策略</th><th>依据</th></tr></thead>
+      <tbody>
+        <tr><td><code>consistent_hash</code></td><td><code>x-session-id</code> 等头 → body 的 <code>session_params.session_id</code> / <code>user</code> → 请求体哈希</td></tr>
+        <tr><td><code>cache_aware</code></td><td>每 worker 的前缀树命中率与队列长度</td></tr>
+        <tr><td><code>power_of_two</code></td><td>随机两个 worker，取负载低者</td></tr>
+        <tr><td><code>round_robin</code> / <code>random</code></td><td>轮转或随机</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="hop router">
+    <div class="num">6</div>
+    <h4>构造上游请求</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>router.rs:1337</code> <code>send_typed_request</code></div>
+    <p>URL 为 <code>&lt;worker_url&gt;/v1/chat/completions</code>；透传原请求头，跳过
+    <code>Content-Type</code> / <code>Content-Length</code>；DP 模式追加
+    <code>X-data-parallel-rank</code>。body 是原 JSON。</p>
+  </div>
+</div>
+
+<h2 id="router-pd">3. PD 两阶段转发</h2>
+<div class="chain">
+  <div class="hop router">
+    <div class="num">7</div>
+    <h4>分别选 prefill 和 decode</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>vllm_pd_router.rs:2139</code> → <code>process_vllm_request</code></div>
+    <p>prefill 与 decode 各有独立 policy。静态 URL 或 ZMQ service discovery 提供候选，
+    选中结果带各自 DP rank。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">8</div>
+    <h4>改写 prefill 请求</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>vllm_pd_router.rs:578</code> <code>prepare_prefill_request</code></div>
+    <p>强制 <code>max_tokens=1</code>、<code>stream=false</code>，删除
+    <code>stream_options</code>，注入 <code>kv_transfer_params</code>。目的只算 KV，不生成正文。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">9</div>
+    <h4>发送 decode 请求</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>vllm_pd_router.rs:264</code> <code>build_decode_kv_transfer_params</code></div>
+    <p>用 prefill 响应中的 connector 信息补齐 decode 的 <code>kv_transfer_params</code>，
+    保留客户端原始 <code>stream</code> 与 <code>max_tokens</code>，用相同
+    <code>X-Request-Id</code> 关联两段请求。</p>
+  </div>
+</div>
+
+<div class="split">
+  <div class="card"><h4>顺序模式</h4>
+    <p>先等 prefill 返回 JSON，取到 <code>kv_transfer_params</code> 后再发 decode。
+    兼容性最好，TTFT 包含一次完整往返。</p></div>
+  <div class="card"><h4>并发模式</h4>
+    <p>NIXL push 或 MoRI-IO write 等场景下，<code>tokio::join!</code> 同时发两段请求，
+    KV 身份来自启动时缓存的 bootstrap 信息。</p></div>
+</div>
+
+<div class="note warn">PD 模式只把 <b>decode</b> 的响应回给客户端。
+prefill 的 <code>max_tokens=1</code> 是 Router 内部改写，客户端不可见。</div>
+
+<h2 id="mooncake">4. Mooncake 池化与传输</h2>
+
+<p>Mooncake 在本仓库里有<b>两种完全不同的用法</b>，配置和链路不能混：</p>
+
+<table>
+  <thead><tr><th>形态</th><th>connector</th><th>KV 存放位置</th><th>适用场景</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>共享池</b>（pooling）</td>
+      <td><code>AscendStoreConnector</code><br>旧名 <code>MooncakeConnectorStoreV1</code></td>
+      <td>Mooncake 分布式存储池，按 block hash 键寻址</td>
+      <td>多实例共享前缀缓存；PD 与非 PD 都能用</td>
+    </tr>
+    <tr>
+      <td><b>直连 P2P</b></td>
+      <td><code>MooncakeConnectorV1</code><br>（含 <code>MooncakeHybridConnector</code>）</td>
+      <td>直接从 prefill 的 NPU 显存读到 decode 的 NPU 显存</td>
+      <td>PD 分离，一对一传输，不经过共享池</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="note">Router 的 <code>--kv-connector mooncake</code> 只负责给 PD 两阶段请求注入
+<code>kv_transfer_params</code>（<code>transfer_id</code>、<code>remote_bootstrap_addr</code>、
+<code>remote_engine_id</code>），它<b>不参与</b> KV 的实际搬运。
+真正的池化/传输都发生在 vLLM Worker 的 connector 里。</div>
+
+<h3>4.1 形态一：共享池（AscendStore + MooncakeBackend）</h3>
+
+<p>核心思想：把 KV cache block 当作内容寻址对象。key 由“模型 + 并行 rank + 前缀 block hash”
+组成。任何实例先 <code>lookup</code>，命中就 <code>get</code>，未命中正常计算并在结束后 <code>put</code>。</p>
+
+<div class="chain">
+  <div class="hop parse">
+    <div class="num">10</div>
+    <h4>connector 注册</h4>
+    <div class="where"><span class="tag t-parse">Connector</span> <code>vllm_ascend/distributed/kv_transfer/__init__.py</code></div>
+    <p>插件启动时把 <code>AscendStoreConnector</code> 与兼容名
+    <code>MooncakeConnectorStoreV1</code> 注册进 <code>KVConnectorFactory</code>。
+    池后端由 <code>backend</code> 映射到 <code>MooncakeBackend</code> /
+    <code>MemcacheBackend</code> / <code>YuanrongBackend</code>。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">11</div>
+    <h4>建立池连接</h4>
+    <div class="where"><span class="tag t-parse">Connector</span> <code>backend/mooncake_backend.py</code> <code>_setup_store</code></div>
+    <p>读取 <code>MOONCAKE_CONFIG_PATH</code> 指向的 JSON，调用
+    <code>MooncakeDistributedStore.setup(local_hostname, metadata_server,
+    global_segment_size, local_buffer_size, protocol="ascend", rdma_devices,
+    master_server_addr, engine)</code>。<code>global_segment_size</code> 是本 rank
+    向池子贡献的显存大小。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">12</div>
+    <h4>调度侧查池</h4>
+    <div class="where"><span class="tag t-engine">Scheduler</span> <code>pool_scheduler.py</code> <code>get_num_new_matched_tokens</code></div>
+    <p>按 block hash 生成 pool key，调用
+    <code>store_scheduler.batch_is_exist(keys)</code> 判断命中长度。命中则告诉
+    scheduler “这些 token 不用算”，并登记 load spec。</p>
+    <p>非 layerwise 路径下，EngineCore 不直接持有 store 连接，而是通过
+    <code>LookupKeyClient</code> 走 ZMQ REQ 到 rank 0 的 <code>LookupKeyServer</code>，
+    由后者执行 <code>batch_is_exist</code> 并回传命中 token 数；<code>lookup_async</code>
+    可让这一步不阻塞调度。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">13</div>
+    <h4>注册 KV 显存</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>pool_worker.py</code> <code>register_kv_caches</code></div>
+    <p>把所有 KV cache 张量的 <code>data_ptr()</code> 与长度登记到传输引擎
+    （<code>register_buffer</code>）。之后 <code>batch_copy</code> 才能直接在显存与池之间搬运。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">14</div>
+    <h4>从池里拉取（load）</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>kv_transfer.py</code> <code>KVCacheStoreRecvingThread</code></div>
+    <p><code>start_load_kv</code> 把请求投递给接收线程，线程调用
+    <code>m_store.get(keys, addrs, sizes)</code>。Mooncake 后端对应
+    <code>batch_get_into_multi_buffers</code>，把池中数据直接写入已注册的 KV 显存。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">15</div>
+    <h4>写回池（save）</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>kv_transfer.py</code> <code>KVCacheStoreSendingThread</code></div>
+    <p>请求结束后 <code>save_kv_layer</code> 投递保存任务。线程先
+    <code>store.batch_is_exist(keys)</code> 去重，再用
+    <code>m_store.put(keys, addrs, sizes)</code>（后端为
+    <code>batch_put_from_multi_buffers</code>）写入池，供其他实例复用。</p>
+  </div>
+</div>
+
+<p>池化 key 的构造在 <code>metadata.py</code> 的 <code>PoolKey</code>：</p>
+<pre><code>{cache_prefix}@{model_name}@tp_rank:{tp}@pcp{pcp}@dcp{dcp}@pp_rank:{pp}@group:{gid}@{chunk_hash}</code></pre>
+
+<p><code>chunk_hash</code> 是前缀 block hash。相同前缀、相同并行切分的 block
+在任何实例上都会得到同一个 key，这就是“跨实例前缀缓存共享”的来源。</p>
+
+<h4>配置示例</h4>
+<pre><code>// mooncake.json —— 由 MOONCAKE_CONFIG_PATH 指向
+{
+  "metadata_server": "http://&lt;metadata&gt;:&lt;port&gt;",
+  "master_server_address": "&lt;master&gt;:&lt;port&gt;",
+  "protocol": "ascend",
+  "device_name": "&lt;rdma device&gt;",
+  "global_segment_size": "1GB",
+  "local_buffer_size": "1GB",
+  "preferred_segment": false,
+  "prefer_alloc_in_same_node": true,
+  "enable_ssd_offload": false,
+  "tenant_id": "default"
+}</code></pre>
+
+<pre><code>vllm serve &lt;model&gt; \
+  --kv-transfer-config '{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "backend": "mooncake",
+      "load_async": true,
+      "enable_lookup": true,
+      "save_decode_cache": false
+    }
+  }'</code></pre>
+
+<table>
+  <thead><tr><th>配置</th><th>作用</th><th>默认</th></tr></thead>
+  <tbody>
+    <tr><td><code>backend</code></td><td>池后端：<code>mooncake</code> / <code>memcache</code> / <code>yuanrong</code></td><td><code>mooncake</code></td></tr>
+    <tr><td><code>load_async</code></td><td>拉取走后台线程，不阻塞 forward</td><td>true</td></tr>
+    <tr><td><code>enable_lookup</code></td><td>是否允许该实例查池；纯写入实例可关闭以省 CPU</td><td>true</td></tr>
+    <tr><td><code>save_decode_cache</code></td><td>是否把 decode 增量也写池</td><td>false</td></tr>
+    <tr><td><code>use_layerwise</code></td><td>逐层传输。Mooncake 后端未实现 layerwise 协议，置 true 会静默降级为整块传输；该能力目前仅 <code>memcache</code> 后端具备</td><td>false</td></tr>
+    <tr><td><code>cache_prefix</code></td><td>多租户命名空间，避免相同 hash 冲突</td><td>空</td></tr>
+  </tbody>
+</table>
+
+<div class="note warn">Mooncake 池化后端要求 <code>protocol="ascend"</code>，否则直接抛
+<code>NotImplementedError</code>。<code>enable_ssd_offload</code> 需要 Mooncake
+v0.3.11+，且 <code>ssd_offload_path</code> 必须是绝对路径。</div>
+
+<p><code>use_layerwise</code> 的生效条件是后端声明了 layerwise 协议
+（<code>backend/__init__.py</code> 的 <code>layerwise_protocol</code> 标记）。
+目前只有 <code>memcache</code> 声明了该标记，因此 Mooncake 上置 true 会
+<code>use_layerwise_transfer=False</code>，实际仍走整块 <code>batch_copy</code>。
+另外 layerwise 查询从 block 0 开始，因为它不与本地 prefix cache 对齐。</p>
+
+<h4>池化路径的失败语义</h4>
+<table>
+  <thead><tr><th>事件</th><th>行为</th></tr></thead>
+  <tbody>
+    <tr><td><code>lookup</code> 超时或 master 不可达</td><td>返回全 miss，请求退化为正常计算，不报错</td></tr>
+    <tr><td><code>get</code> 部分 key 失败</td><td>失败 block 记入 <code>invalid_block_ids</code>，由 scheduler 重算</td></tr>
+    <tr><td><code>put</code> 部分 key 失败</td><td>记日志并继续；只影响后续命中率，不影响当前请求正确性</td></tr>
+    <tr><td>key 不存在</td><td><code>batch_get_into_multi_buffers</code> 返回负错误码，按 miss 处理</td></tr>
+  </tbody>
+</table>
+
+<h3>4.2 形态二：直连 P2P（MooncakeConnectorV1）</h3>
+
+<p>PD 分离下，prefill 算完 KV 不落池，而是通过 Mooncake TransferEngine
+直接从 prefill 显存读到 decode 显存。Router 负责把两段请求串起来。</p>
+
+<div class="chain">
+  <div class="hop router">
+    <div class="num">16</div>
+    <h4>Router 生成 transfer_id</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>vllm_pd_router.rs</code> <code>generate_transfer_id</code></div>
+    <p>Mooncake 的 transfer id 形如 <code>xfer-&lt;uuid&gt;</code>。prefill 与 decode
+    两段请求携带同一个 id。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">17</div>
+    <h4>prefill 参数</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>build_prefill_kv_transfer_params</code></div>
+    <pre><code>{"do_remote_decode": true, "do_remote_prefill": false, "transfer_id": "xfer-..."}</code></pre>
+    <p>prefill 只算 KV，不把结果返回给用户。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">18</div>
+    <h4>decode 参数</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>build_mooncake_decode_kv_transfer_params</code></div>
+    <pre><code>{"do_remote_decode": false, "do_remote_prefill": true,
+ "transfer_id": "xfer-...",
+ "remote_bootstrap_addr": "&lt;prefill&gt;:&lt;bootstrap port&gt;",
+ "remote_engine_id": "&lt;engine id&gt;"}</code></pre>
+    <p><code>remote_bootstrap_addr</code> / <code>remote_engine_id</code> 由 Router
+    启动时查询 prefill 的 Mooncake bootstrap server 得到，按 dp_rank 缓存。
+    bootstrap 端口默认 <code>VLLM_MOONCAKE_BOOTSTRAP_PORT=8998</code>；K8s 下也可从
+    <code>vllm.ai/bootstrap-port</code> annotation 获取，Router 以
+    <code>GET /query</code> 查询。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">19</div>
+    <h4>注册显存与握手</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>mooncake_connector.py</code> <code>register_kv_caches</code></div>
+    <p>两侧都调用 <code>global_te.register_buffer(ptrs, lengths)</code> 把 KV 显存
+    注册给 TransferEngine，并通过 ZMQ handshake 端口交换
+    <code>kv_caches_base_addr</code>、<code>te_rpc_port</code>、
+    <code>block_strides</code> 等元数据。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">20</div>
+    <h4>真正搬运</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>_transfer_kv_cache_all_groups</code></div>
+    <p>decode 侧按 <code>transfer_id</code> 找到远端 metadata，计算每 layer 的源/目标地址
+    与长度，调用 TransferEngine 的
+    <code>batch_transfer_sync_read(session_id, src, dst, length)</code>：
+    <b>decode 主动从 prefill 远端显存拉取</b>，写入本地 KV block。
+    完成后通过握手通道回 done 信号，释放远端端口计数。</p>
+  </div>
+</div>
+
+<h4>与池化的关键差异</h4>
+<table>
+  <thead><tr><th>维度</th><th>AscendStore（池化）</th><th>MooncakeConnectorV1（直连）</th></tr></thead>
+  <tbody>
+    <tr><td>寻址</td><td>block hash → pool key</td><td>transfer_id + remote engine id</td></tr>
+    <tr><td>生命周期</td><td>数据留在池里，可被任意后续请求命中</td><td>一次请求一次传输，用完即弃</td></tr>
+    <tr><td>是否依赖 Router</td><td>不依赖；单实例也能用</td><td>依赖 Router 注入 <code>kv_transfer_params</code></td></tr>
+    <tr><td>典型角色</td><td><code>kv_both</code> / <code>kv_producer</code> / <code>kv_consumer</code></td><td>prefill=<code>kv_producer</code>，decode=<code>kv_consumer</code></td></tr>
+    <tr><td>握手</td><td>通过 metadata / master server</td><td>ZMQ handshake + bootstrap server</td></tr>
+    <tr><td>传输 API</td><td><code>batch_put_from_multi_buffers</code> / <code>batch_get_into_multi_buffers</code></td><td><code>batch_transfer_sync_read</code></td></tr>
+  </tbody>
+</table>
+
+<div class="note warn">不要在 PD 分离场景里同时配 <code>MooncakeConnectorV1</code> 与
+<code>AscendStoreConnector</code> 去搬同一份 KV：前者按 transfer_id 点对点搬，
+后者按 hash 写池，会产生重复流量，且 decode 可能拿到不一致的来源。
+需要“PD + 跨实例缓存复用”时，用 <code>AscendStoreConnector</code> 的
+<code>kv_producer</code>/<code>kv_consumer</code> 角色，让两边都走池。</div>
+
+<h2 id="api-server">5. vLLM API Server</h2>
+<div class="chain">
+  <div class="hop parse">
+    <div class="num">21</div>
+    <h4>HTTP 入口</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>vllm/entrypoints/openai/chat_completion/api_router.py:53</code></div>
+    <p><code>create_chat_completion</code> 取得 <code>OpenAIServingChat</code>，调用
+    <code>handler.create_chat_completion</code>。流式返回
+    <code>StreamingResponse</code>，非流式返回 <code>JSONResponse</code>。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">22</div>
+    <h4>渲染与分词</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:192</code> <code>render_chat_request</code></div>
+    <p><code>OnlineRenderer.render_chat</code> 执行 chat template、tokenize、
+    multimodal 预处理，产出 <code>EngineInput</code>。Router 注入的
+    <code>X-data-parallel-rank</code> 由 <code>_get_data_parallel_rank</code> 读取。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">23</div>
+    <h4>创建解析器</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:245</code></div>
+    <p>如果配置了 <code>--reasoning-parser</code> 或 <code>--tool-call-parser</code>，
+    这里实例化 <code>Parser</code>。它只在 API 进程使用，不进入 EngineCore。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">24</div>
+    <h4>发起生成</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:343</code> <code>engine_client.generate</code></div>
+    <p>用 <code>request.to_sampling_params()</code> 构造参数，把
+    <code>reasoning_ended</code> 与 <code>reasoning_parser_kwargs</code> 一并传入。
+    后者影响结构化输出何时开始约束。</p>
+  </div>
+</div>
+
+<h2 id="parsers-request">6. 解析器初始化与请求改写</h2>
+
+<h3>6.1 谁在什么时候被创建</h3>
+<table>
+  <thead><tr><th>对象</th><th>创建位置</th><th>生命周期</th></tr></thead>
+  <tbody>
+    <tr><td><code>Parser</code> 子类</td><td><code>ParserManager.get_parser</code>（进程启动时）</td><td>每请求实例化一次</td></tr>
+    <tr><td><code>ReasoningParser</code> 实例</td><td><code>Parser.__init__</code></td><td>随请求，保存流式状态</td></tr>
+    <tr><td><code>ToolParser</code> 实例</td><td><code>Parser.__init__</code></td><td>随请求，保存已发送参数</td></tr>
+    <tr><td>结构化输出侧 reasoner</td><td><code>StructuredOutputManager._get_reasoner</code></td><td>请求级懒加载，独立于 API Server</td></tr>
+  </tbody>
+</table>
+
+<p><code>ParserManager</code> 只做装配：把 <code>reasoning_parser_name</code> 与
+<code>tool_parser_name</code> 解析成类，再生成同时持有两者的
+<code>DelegatingParser</code> 子类。</p>
+
+<h3>6.2 请求改写：<code>adjust_request</code></h3>
+<pre><code># vllm/parser/abstract_parser.py:511
+DelegatingParser.adjust_request
+  ├─ reasoning_parser.adjust_request(request)
+  ├─ _apply_structural_tag(request)
+  └─ tool_parser.adjust_request(request)</code></pre>
+
+<p>这一阶段发生在 tokenize 之后、<code>engine_client.generate</code> 之前，
+决定模型生成时是否被 grammar 约束。</p>
+
+<div class="note"><code>reasoning_ended</code> 也会在这里初步判断：如果 prompt
+本身已落在 <code>&lt;/think&gt;</code> 之后，API Server 直接告诉引擎“不用再等推理结束”，
+结构化输出可从第一个生成 token 生效。</div>
+
+<h2 id="engine">7. EngineCore 调度</h2>
+<div class="chain">
+  <div class="hop engine">
+    <div class="num">25</div>
+    <h4>入队</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>async_llm.py:420</code> <code>_add_request</code></div>
+    <p><code>InputProcessor.process_inputs</code> 生成 <code>EngineCoreRequest</code>；
+    <code>OutputProcessor.add_request</code> 建 detokenizer 与请求队列；
+    <code>AsyncMPClient.add_request_async</code> 经 ZMQ 发往 EngineCore。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">26</div>
+    <h4>主循环</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>core.py:1378</code> <code>run_busy_loop</code></div>
+    <p><code>_process_input_queue</code> 处理 ADD/ABORT，<code>_process_engine_step</code>
+    调用 <code>step_fn</code>，把 <code>EngineCoreOutputs</code> 放入输出队列。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">27</div>
+    <h4>调度</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>vllm/v1/core/sched/scheduler.py:439</code></div>
+    <p><code>Scheduler.schedule</code> 按 token budget 决定本步参与的 request、
+    各自补多少 token、分配哪些 KV block，输出 <code>SchedulerOutput</code>。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">28</div>
+    <h4>grammar bitmask</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>scheduler.py:1646</code> <code>get_grammar_bitmask</code></div>
+    <p>如果有结构化输出，这里生成 <code>GrammarOutput</code>。
+    <code>should_fill_bitmask</code> 会参考 <code>reasoning_ended</code>，决定本步
+    是否对 logits 施加约束。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">29</div>
+    <h4>RPC 到 Worker</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>core.py:584</code> <code>EngineCore.step</code></div>
+    <p><code>model_executor.execute_model(...)</code> 与
+    <code>model_executor.sample_tokens(...)</code> 是两次独立
+    <code>collective_rpc</code>，中间用 <code>future.result()</code> 衔接。</p>
+  </div>
+</div>
+
+<h2 id="worker">8. Worker 与模型 forward</h2>
+<div class="chain">
+  <div class="hop worker">
+    <div class="num">30</div>
+    <h4>Worker 入口</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>vllm_ascend/worker/worker.py:649</code></div>
+    <p><code>NPUWorker.execute_model</code> 处理 PP 收发、性能采集，然后调用
+    <code>self.model_runner.execute_model(scheduler_output, intermediate_tensors)</code>。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">31</div>
+    <h4>准备输入</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>model_runner_v1.py:3294</code></div>
+    <p><code>_update_states</code> 增删 request，<code>_prepare_inputs</code> 生成
+    <code>input_ids</code>、<code>positions</code>、<code>attn_metadata</code>、
+    <code>logits_indices</code> 等张量。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">32</div>
+    <h4>模型执行</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>model_runner_v1.py:4238</code> <code>_model_forward</code></div>
+    <p>如果 <code>self.model</code> 被 ACLGraph 包装且命中 batch descriptor，
+    这里执行 <code>aclgraph.replay()</code>；否则逐层 eager 执行。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">33</div>
+    <h4>logits</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>model_runner_v1.py:3725</code></div>
+    <p><code>hidden_states[logits_indices]</code> 经 <code>model.compute_logits</code>
+    投影成 <code>[num_logits, vocab_size]</code>，存入
+    <code>execute_model_state</code>，<code>execute_model</code> 返回 <code>None</code>。</p>
+  </div>
+</div>
+
+<pre><code>AscendDeepseekV4ForCausalLM.forward      vllm_ascend/models/deepseek_v4/model.py:1072
+  └─ DeepseekV4Model.forward              :903
+       ├─ embed_input_ids
+       ├─ for layer:
+       │    ├─ input_layernorm
+       │    ├─ self_attn  (MLA / SFA / DSA backend)
+       │    ├─ post_attention_layernorm
+       │    └─ MLP / MoE
+       └─ hc_head + norm</code></pre>
+
+<h2 id="sampling">9. 采样与 token 回传</h2>
+<div class="chain">
+  <div class="hop worker">
+    <div class="num">34</div>
+    <h4>采样</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>model_runner_v1.py:3791</code> <code>sample_tokens</code></div>
+    <p>取出 <code>execute_model_state</code>，可选地应用
+    <code>apply_grammar_bitmask</code>，然后 <code>_sample</code> →
+    <code>Sampler.forward</code>，得到下一个 token。</p>
+  </div>
+  <div class="hop worker">
+    <div class="num">35</div>
+    <h4>bookkeeping</h4>
+    <div class="where"><span class="tag t-worker">Worker</span> <code>model_runner_v1.py:3907</code></div>
+    <p><code>_bookkeeping_sync</code> 把 <code>sampled_token_ids</code> 搬到 CPU，
+    整理 logprobs，组装 <code>ModelRunnerOutput</code>。</p>
+  </div>
+  <div class="hop engine">
+    <div class="num">36</div>
+    <h4>回传 EngineCore</h4>
+    <div class="where"><span class="tag t-engine">EngineCore</span> <code>scheduler.py:1670</code></div>
+    <p><code>update_from_output</code> 把 token 归属到 request、更新停止条件，
+    生成 <code>EngineCoreOutputs</code> 并推回 API Server。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">37</div>
+    <h4>detokenize</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>output_processor.py:589</code></div>
+    <p><code>IncrementalDetokenizer.update</code> 把 token id 变成增量文本；
+    检查 stop string 后 <code>make_request_output</code> 产出 <code>RequestOutput</code>。</p>
+  </div>
+</div>
+
+<h2 id="parsers-response">10. reasoning / tool call 解析</h2>
+
+<p>解析发生在 API Server 进程，使用完整的 <code>RequestOutput.text</code> 或其增量 delta。
+核心原则：<b>先切 reasoning，再在剩余 content 上抽 tool call</b>。</p>
+
+<h3>10.1 非流式路径</h3>
+<div class="chain">
+  <div class="hop parse">
+    <div class="num">38</div>
+    <h4>入口</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:844</code> <code>chat_completion_full_generator</code></div>
+    <p>拿到最后一个 <code>RequestOutput</code>，对每个 choice 调用
+    <code>parser.parse(output.text, request, ...)</code>。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">39</div>
+    <h4>先 reasoning</h4>
+    <div class="where"><span class="tag t-parse">Parser</span> <code>abstract_parser.py:785</code> <code>DelegatingParser.parse</code></div>
+    <pre><code>reasoning, content = self.extract_reasoning(model_output, request)</code></pre>
+    <p>以 DeepSeek R1 为例，<code>DeepseekR1ReasoningParser</code> 找
+    <code>&lt;think&gt;…&lt;/think&gt;</code>，返回思考文本和去掉思考段后的 content。
+    没有 reasoning parser 时 reasoning 为 <code>None</code>，content 是全文。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">40</div>
+    <h4>再 tool call</h4>
+    <div class="where"><span class="tag t-parse">Parser</span> <code>abstract_parser.py:417</code> <code>_extract_tool_calls</code></div>
+    <p>根据 <code>tool_choice</code> 分支：</p>
+    <ul>
+      <li><code>none</code>：不解析，content 原样保留。</li>
+      <li><code>named</code>：整个 content 作为该函数的 arguments。</li>
+      <li><code>required</code> / <code>auto</code>：调用具体
+      <code>ToolParser.extract_tool_calls(content, request)</code>，例如 Hermes 解析
+      <code>&lt;tool_call&gt;{...}&lt;/tool_call&gt;</code>。</li>
+    </ul>
+  </div>
+  <div class="hop parse">
+    <div class="num">41</div>
+    <h4>组装响应</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:925</code></div>
+    <p>根据是否解析出 tool call 决定 <code>message</code> 放 <code>content</code>
+    还是 <code>tool_calls</code>，并把 <code>finish_reason</code> 从
+    <code>stop</code> 改写为 <code>tool_calls</code>（named tool choice 除外）。</p>
+  </div>
+</div>
+
+<h3>10.2 流式路径</h3>
+<div class="chain">
+  <div class="hop parse">
+    <div class="num">42</div>
+    <h4>逐 delta 解析</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:615</code></div>
+    <pre><code>delta_message = parser.parse_delta(
+    delta_text=delta_text,
+    delta_token_ids=as_list(output.token_ids),
+    request=request,
+    prompt_token_ids=res.prompt_token_ids,
+    finished=output.finish_reason is not None,
+)</code></pre>
+    <p>每个 choice 有自己的 <code>Parser</code> 实例，因此
+    <code>StreamState</code>（已发送文本、是否结束推理、tool call 计数）天然隔离。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">43</div>
+    <h4>状态机</h4>
+    <div class="where"><span class="tag t-parse">Parser</span> <code>abstract_parser.py:801</code> <code>parse_delta</code></div>
+    <ol>
+      <li>首次拿到 prompt 时，判断 reasoning 是否在 prompt 内已结束。</li>
+      <li>reasoning 阶段调用 <code>extract_reasoning_streaming</code>，
+      用 <code>is_reasoning_end_streaming</code> 检测结束标记。</li>
+      <li>结束后切到 tool call 阶段，重置 previous 文本，只把 reasoning 之后的文本
+      喂给 tool parser。</li>
+      <li>最后 flush 引擎侧缓冲的残留字符，并按 <code>include_reasoning</code>
+      决定是否隐藏 reasoning。</li>
+    </ol>
+  </div>
+  <div class="hop parse">
+    <div class="num">44</div>
+    <h4>tool call 增量</h4>
+    <div class="where"><span class="tag t-parse">ToolParser</span> <code>abstract_tool_parser.py:176</code></div>
+    <p>具体 parser 维护 <code>prev_tool_call_arr</code>、<code>current_tool_id</code>、
+    <code>streamed_args_for_tool</code>，只输出“尚未发送”的参数字符串，
+    保证 SSE 增量可拼接成完整 JSON。</p>
+  </div>
+  <div class="hop parse">
+    <div class="num">45</div>
+    <h4>写 SSE</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:700</code></div>
+    <p>把 <code>DeltaMessage</code> 包成 <code>ChatCompletionStreamResponse</code>，
+    <code>yield "data: {json}\n\n"</code>；所有 choice 结束后
+    <code>yield "data: [DONE]\n\n"</code>。</p>
+  </div>
+</div>
+
+<div class="note">reasoning parser 与 tool parser 共享同一个 <code>StreamState</code>，
+但职责严格分阶段。reasoning 未结束时 tool parser 不会被喂数据，
+避免把 <code>&lt;think&gt;</code> 里的 JSON 误识别成函数调用。</div>
+
+<h3>10.3 容易踩坑的细节</h3>
+<table>
+  <thead><tr><th>细节</th><th>行为</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td><code>include_reasoning=false</code></td><td>reasoning 字段在 delta 或最终 message 中被清空</td><td>客户端看不到思考内容，但 token 仍生成和计费</td></tr>
+    <tr><td><code>tool_choice="none"</code></td><td>即使配了 tool parser 也不抽 tool call</td><td>防止模型幻觉出函数调用</td></tr>
+    <tr><td><code>reasoning_ended</code> 提前为 true</td><td>EngineCore 的 grammar 从第一个 token 就约束</td><td>prompt 已含 <code>&lt;/think&gt;</code> 时避免浪费推理预算</td></tr>
+  </tbody>
+</table>
+
+<h2 id="response">11. 响应回传</h2>
+<div class="chain">
+  <div class="hop parse">
+    <div class="num">46</div>
+    <h4>API Server 出站</h4>
+    <div class="where"><span class="tag t-parse">API Server</span> <code>serving.py:422</code> / <code>:844</code></div>
+    <p>流式返回 <code>AsyncGenerator[str, None]</code>，非流式返回
+    <code>ChatCompletionResponse</code>。两者都由
+    <code>api_router.create_chat_completion</code> 包成
+    <code>StreamingResponse</code> 或 <code>JSONResponse</code>。</p>
+  </div>
+  <div class="hop router">
+    <div class="num">47</div>
+    <h4>Router 回传</h4>
+    <div class="where"><span class="tag t-router">Router</span> <code>router.rs:1556</code> / <code>:1632</code></div>
+    <p>流式分支设置 <code>Content-Type: text/event-stream</code>，用
+    <code>Body::from_stream</code> 把上游 chunk 原样转发；检测到
+    <code>data: [DONE]</code> 时释放 worker 负载计数。</p>
+  </div>
+  <div class="hop">
+    <div class="num">48</div>
+    <h4>curl 收到</h4>
+    <div class="where">客户端</div>
+    <p>非流式一次性 JSON；流式连续 <code>data:</code> 事件，最后以
+    <code>data: [DONE]</code> 结束。</p>
+  </div>
+</div>
+
+<h2 id="failure">12. 异常与边界</h2>
+<table>
+  <thead><tr><th>场景</th><th>发生位置</th><th>结果</th></tr></thead>
+  <tbody>
+    <tr><td>Router 无健康 worker</td><td><code>route_typed_request</code></td><td>503 <code>No available workers</code></td></tr>
+    <tr><td>上游 5xx / 429 / 超时</td><td><code>RetryExecutor</code></td><td>指数退避后重试其他 worker</td></tr>
+    <tr><td>上游 4xx</td><td><code>RetryExecutor</code></td><td>不重试，不计入熔断失败</td></tr>
+    <tr><td>PD prefill 失败</td><td><code>process_vllm_two_stage_request_discovered</code></td><td>直接 5xx，不发 decode</td></tr>
+    <tr><td>Mooncake 池 lookup 失败</td><td><code>KVPoolScheduler</code></td><td>按全 miss 处理，退化为正常计算</td></tr>
+    <tr><td>Mooncake 池 get 部分失败</td><td><code>KVCacheStoreRecvingThread</code></td><td>失败 block 记入 invalid_block_ids，由 scheduler 重算</td></tr>
+    <tr><td>Mooncake P2P 传输失败</td><td><code>_transfer_kv_cache_all_groups</code></td><td>抛 <code>RuntimeError</code>，请求失败</td></tr>
+    <tr><td>客户端中途断开</td><td><code>AsyncLLM.generate</code></td><td>捕获 <code>CancelledError</code> 后 abort，释放 KV block</td></tr>
+    <tr><td>tool parser 抛异常</td><td><code>DelegatingParser.extract_tool_calls</code></td><td>异常上抛，请求失败</td></tr>
+    <tr><td>reasoning 未结束但流已终止</td><td><code>finalize_generation</code></td><td>未输出 reasoning 缓冲提升为 content</td></tr>
+  </tbody>
+</table>
+
+<h2 id="reference">13. 速查表</h2>
+<h3>13.1 组件对照</h3>
+<table>
+  <thead><tr><th>层</th><th>组件</th><th>源码</th></tr></thead>
+  <tbody>
+    <tr><td>Router HTTP</td><td><code>v1_chat_completions</code></td><td><code>router/src/server.rs:245</code></td></tr>
+    <tr><td>Router 普通</td><td><code>Router::route_typed_request</code></td><td><code>router/src/routers/http/router.rs:1031</code></td></tr>
+    <tr><td>Router PD</td><td><code>VllmPDRouter::route_chat</code></td><td><code>router/src/routers/http/vllm_pd_router.rs:2139</code></td></tr>
+    <tr><td>API Server</td><td><code>OpenAIServingChat</code></td><td><code>vllm/entrypoints/openai/chat_completion/serving.py:110</code></td></tr>
+    <tr><td>Parser 装配</td><td><code>ParserManager.get_parser</code></td><td><code>vllm/parser/parser_manager.py:76</code></td></tr>
+    <tr><td>Parser 调度</td><td><code>DelegatingParser.parse / parse_delta</code></td><td><code>vllm/parser/abstract_parser.py:785 / :801</code></td></tr>
+    <tr><td>Reasoning 基类</td><td><code>ReasoningParser</code></td><td><code>vllm/reasoning/abs_reasoning_parsers.py:26</code></td></tr>
+    <tr><td>Tool 基类</td><td><code>ToolParser</code></td><td><code>vllm/tool_parsers/abstract_tool_parser.py:43</code></td></tr>
+    <tr><td>EngineCore</td><td><code>EngineCore.step</code></td><td><code>vllm/v1/engine/core.py:584</code></td></tr>
+    <tr><td>调度器</td><td><code>Scheduler.schedule</code></td><td><code>vllm/v1/core/sched/scheduler.py:439</code></td></tr>
+    <tr><td>Worker</td><td><code>NPUWorker.execute_model</code></td><td><code>vllm_ascend/worker/worker.py:649</code></td></tr>
+    <tr><td>Runner</td><td><code>NPUModelRunner.execute_model</code></td><td><code>vllm_ascend/worker/model_runner_v1.py:3294</code></td></tr>
+    <tr><td>采样</td><td><code>NPUModelRunner.sample_tokens</code></td><td><code>vllm_ascend/worker/model_runner_v1.py:3791</code></td></tr>
+    <tr><td>图模式</td><td><code>ACLGraphWrapper.__call__</code></td><td><code>vllm_ascend/compilation/acl_graph.py:142</code></td></tr>
+    <tr><td>KV 池 connector</td><td><code>AscendStoreConnector</code></td><td><code>vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py</code></td></tr>
+    <tr><td>KV 池后端</td><td><code>MooncakeBackend</code></td><td><code>.../ascend_store/backend/mooncake_backend.py</code></td></tr>
+    <tr><td>池 lookup</td><td><code>KVPoolScheduler.get_num_new_matched_tokens</code></td><td><code>.../ascend_store/pool_scheduler.py</code></td></tr>
+    <tr><td>池传输线程</td><td><code>KVCacheStoreSendingThread / RecvingThread</code></td><td><code>.../ascend_store/kv_transfer.py</code></td></tr>
+    <tr><td>PD 直连 connector</td><td><code>MooncakeConnector</code></td><td><code>vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py</code></td></tr>
+    <tr><td>RDMA 引擎</td><td><code>GlobalTE</code></td><td><code>.../kv_transfer/utils/mooncake_transfer_engine.py</code></td></tr>
+  </tbody>
+</table>
+
+<h3>13.2 数据结构流转</h3>
+<pre><code>curl JSON
+  → ChatCompletionRequest (Router, serde)
+  → ChatCompletionRequest (vLLM, Pydantic)
+  → EngineInput                (render + tokenize)
+  → EngineCoreRequest          (ZMQ, 含 data_parallel_rank)
+  → SchedulerOutput            (本步 batch 与 KV block)
+  → input_ids / attn_metadata  (NPU 张量)
+  → hidden_states → logits
+  → SamplerOutput → ModelRunnerOutput
+  → EngineCoreOutput → EngineCoreOutputs
+  → RequestOutput              (detokenize 后)
+  → DeltaMessage / ChatMessage (reasoning + tool call)
+  → ChatCompletionResponse / SSE chunk
+  → curl</code></pre>
+
+<h3>13.3 最短心智模型</h3>
+<ol>
+  <li>Router 决定“谁来做”：一次转发，或 prefill + decode 两次。</li>
+  <li>API Server 决定“怎么问”：模板、token、sampling、grammar。</li>
+  <li>EngineCore 决定“这一秒算哪些 token”：batch、KV block、调度顺序。</li>
+  <li>Worker 决定“怎么算”：张量布局、attention backend、ACLGraph replay。</li>
+  <li>Mooncake 决定“KV 放哪、怎么搬”：共享池按 hash 存取，直连按 transfer_id 拉取。</li>
+  <li>Parser 决定“怎么讲”：reasoning 与 content 分离，tool call 结构化。</li>
+</ol>
+
+</main>
+</div>
+</body>
+</html>
