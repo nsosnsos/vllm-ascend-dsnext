@@ -1189,25 +1189,57 @@ def should_skip_allreduce_across_dp_group(
     computed once in init, and select_moe_comm_method is just config lookups, so
     this is cheap and avoids id-reuse / stale-cache / init-ordering hazards.
     """
+
+    def report(result: bool, reason: str, **details: Any) -> bool:
+        detail_str = ", ".join(f"{key}={value!r}" for key, value in details.items())
+        logger.info(
+            "[DP_ALLREDUCE_DIAG] skip=%s reason=%s %s",
+            result,
+            reason,
+            detail_str,
+        )
+        return result
+
     if dp_moe_policy is not None:
-        return True
+        return report(
+            True,
+            "explicit_dp_moe_policy",
+            dp_moe_policy=dp_moe_policy,
+            is_draft_model=is_draft_model,
+        )
 
     ascend_config = get_ascend_config()
+    mc2_comm_alg = ascend_config.get_mc2_comm_alg()
     # When mc2_comm_alg == "hierarchy", dispatch/combine op don't support dynamic global_bs,
     # we need to do allreduce and pad token across dp every step.
-    if ascend_config.get_mc2_comm_alg() == "hierarchy":
-        return False
+    if mc2_comm_alg == "hierarchy":
+        return report(False, "hierarchy_comm", mc2_comm_alg=mc2_comm_alg)
 
     # For dense models, since we don't actually need dp communication, we simply skip it.
     # This usually happens when main model is moe while eagle draft model is dense.
     is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
     if not is_context_moe_model:
-        return True
+        return report(
+            True,
+            "dense_model",
+            is_draft_model=is_draft_model,
+            is_context_moe_model=is_context_moe_model,
+            mc2_comm_alg=mc2_comm_alg,
+        )
 
     # Only applicable to MoE models on KV consumer ranks.
-    is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
+    kv_transfer_config_exists = vllm_config.kv_transfer_config is not None
+    is_kv_consumer = kv_transfer_config_exists and vllm_config.kv_transfer_config.is_kv_consumer
     if not is_kv_consumer:
-        return False
+        return report(
+            False,
+            "not_kv_consumer",
+            is_draft_model=is_draft_model,
+            is_context_moe_model=is_context_moe_model,
+            kv_transfer_config_exists=kv_transfer_config_exists,
+            is_kv_consumer=is_kv_consumer,
+            mc2_comm_alg=mc2_comm_alg,
+        )
 
     from vllm_ascend.ascend_forward_context import (
         get_mc2_tokens_capacity,
@@ -1216,37 +1248,77 @@ def should_skip_allreduce_across_dp_group(
     )
     from vllm_ascend.ops.fused_moe.moe_comm_method import MoECommType
 
-    if use_cann_megamoe(vllm_config):
-        return False
+    cann_megamoe = use_cann_megamoe(vllm_config)
+    if cann_megamoe:
+        return report(
+            False,
+            "cann_megamoe_enabled",
+            is_draft_model=is_draft_model,
+            is_context_moe_model=is_context_moe_model,
+            is_kv_consumer=is_kv_consumer,
+            use_cann_megamoe=cann_megamoe,
+            mc2_comm_alg=mc2_comm_alg,
+        )
 
     def get_comm_method(n: int):
         return select_moe_comm_method(n, vllm_config)
 
     scheduler_config = vllm_config.scheduler_config
-    if get_comm_method(_MIN_NONEMPTY_MOE_BATCH_TOKENS) == MoECommType.FUSED_MC2:
-        return False
+    min_batch_tokens = _MIN_NONEMPTY_MOE_BATCH_TOKENS
+    min_batch_comm_method = get_comm_method(min_batch_tokens)
+    if min_batch_comm_method == MoECommType.FUSED_MC2:
+        return report(
+            False,
+            "min_nonempty_batch_uses_fused_mc2",
+            is_draft_model=is_draft_model,
+            is_kv_consumer=is_kv_consumer,
+            use_cann_megamoe=cann_megamoe,
+            min_batch_tokens=min_batch_tokens,
+            min_batch_comm_method=min_batch_comm_method,
+            mc2_comm_alg=mc2_comm_alg,
+        )
 
     # potential_max_tokens is read from the set/get global (computed once in init).
     # if mc2 is used in decode max potential tokens case, we can skip allreduce in decode only case.
-    decode_comm_method = get_comm_method(get_potential_max_tokens())
+    potential_max_tokens = get_potential_max_tokens()
+    decode_comm_method = get_comm_method(potential_max_tokens)
     # For prefill, use the scheduler's max_num_batched_tokens for a single batch.
     # if mc2 is used in prefill max potential tokens case and prefill and decode have the same cudagraph mode,
     # we can skip allreduce in chunked prefill case.
-    prefill_comm_method = get_comm_method(scheduler_config.max_num_batched_tokens)
+    max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+    prefill_comm_method = get_comm_method(max_num_batched_tokens)
     if MoECommType.FUSED_MC2 in {decode_comm_method, prefill_comm_method}:
-        return False
+        return report(
+            False,
+            "decode_or_prefill_uses_fused_mc2",
+            is_draft_model=is_draft_model,
+            is_kv_consumer=is_kv_consumer,
+            use_cann_megamoe=cann_megamoe,
+            min_batch_tokens=min_batch_tokens,
+            min_batch_comm_method=min_batch_comm_method,
+            potential_max_tokens=potential_max_tokens,
+            decode_comm_method=decode_comm_method,
+            max_num_batched_tokens=max_num_batched_tokens,
+            prefill_comm_method=prefill_comm_method,
+            mc2_comm_alg=mc2_comm_alg,
+        )
 
     decode_can_skip = decode_comm_method == MoECommType.MC2
     prefill_must_use_mc2 = prefill_comm_method == MoECommType.MC2
-    uniform_cudagraph_mode = not vllm_config.compilation_config.cudagraph_mode.separate_routine()
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    separate_routine = cudagraph_mode.separate_routine()
+    uniform_cudagraph_mode = not separate_routine
     chunked_prefill_can_skip = prefill_must_use_mc2 and uniform_cudagraph_mode
 
     # The private circle pool pins the D node (kv_consumer, gated above) to
     # decode-only, so the prefill term is not required. It still needs the
     # prefill range to map to MC2: skipping pads no tokens, so a larger step
     # would select ALLGATHER on that rank while decode ranks select MC2.
-    private_circle_decode_only = envs_ascend.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and prefill_must_use_mc2
-    if envs_ascend.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL and not prefill_must_use_mc2:
+    private_circle_pool_enabled = envs_ascend.VLLM_ASCEND_ENABLE_PRIVATE_CIRCLE_POOL
+    private_circle_decode_only = private_circle_pool_enabled and prefill_must_use_mc2
+    recompute_scheduler_enable = ascend_config.scheduler_config.recompute_scheduler_enable
+    mc2_capacity = None
+    if private_circle_pool_enabled and not prefill_must_use_mc2:
         mc2_capacity = get_mc2_tokens_capacity()
         logger.warning_once(
             "The V4.1 private circle pool is enabled on this decode node but the "
@@ -1254,16 +1326,48 @@ def should_skip_allreduce_across_dp_group(
             "MC2 capacity (%s), so a step beyond the capacity could select a "
             "different MoE comm method across ranks. Set max_num_batched_tokens "
             "to <= %s on the decode node to enable the skip.",
-            scheduler_config.max_num_batched_tokens,
+            max_num_batched_tokens,
             mc2_capacity,
             mc2_capacity,
         )
-    return decode_can_skip and (
+
+    result = decode_can_skip and (
         chunked_prefill_can_skip
-        or ascend_config.scheduler_config.recompute_scheduler_enable
+        or recompute_scheduler_enable
         or private_circle_decode_only
     )
-
+    reason = (
+        "skip_condition_satisfied"
+        if result
+        else "decode_or_prefill_condition_not_satisfied"
+    )
+    return report(
+        result,
+        reason,
+        is_draft_model=is_draft_model,
+        dp_moe_policy=dp_moe_policy,
+        mc2_comm_alg=mc2_comm_alg,
+        is_context_moe_model=is_context_moe_model,
+        kv_transfer_config_exists=kv_transfer_config_exists,
+        is_kv_consumer=is_kv_consumer,
+        use_cann_megamoe=cann_megamoe,
+        min_batch_tokens=min_batch_tokens,
+        min_batch_comm_method=min_batch_comm_method,
+        potential_max_tokens=potential_max_tokens,
+        decode_comm_method=decode_comm_method,
+        decode_can_skip=decode_can_skip,
+        max_num_batched_tokens=max_num_batched_tokens,
+        prefill_comm_method=prefill_comm_method,
+        prefill_must_use_mc2=prefill_must_use_mc2,
+        cudagraph_mode=cudagraph_mode,
+        separate_routine=separate_routine,
+        uniform_cudagraph_mode=uniform_cudagraph_mode,
+        chunked_prefill_can_skip=chunked_prefill_can_skip,
+        recompute_scheduler_enable=recompute_scheduler_enable,
+        private_circle_pool_enabled=private_circle_pool_enabled,
+        private_circle_decode_only=private_circle_decode_only,
+        mc2_capacity=mc2_capacity,
+    )
 
 def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     if model_instance is None:
